@@ -173,3 +173,31 @@ class BaseBEVBackbone_multitask(nn.module):
             data_dict['seg_features_up'] = seg_out_high
 
         #############lane  backbone
+        if self.model_cfg.get('OTHER_TASKS', False) and "lane" in self.model_cfg.OTHER_TASKS:
+            # 独立投影
+            # lane_input data_dict['spatial_features_lane] # [4, 64, 144, 144]
+            lane_input = data_dict['spatial_features'] # [4, 64, 496, 432]
+            lane_clip = lane_input[:, :, 200:-200, 72:-72] # [4, 64, 96, 288]
+            lane_x = self.laneblocks[0](lane_clip)
+            lane_x = self.laneblocks[1](lane_x)
+
+            lane_out = self.mixsegnet(lane_x)
+            data_dict['lane_features_2d'] = lane_out
+
+        if isinstance(data_dict, dict):
+            data_dict['spatial_features_2d'] = x
+        else:
+            data_dict = x
+        return data_dict
+
+if __name__ == "__main__":
+    import sys
+    sys.path.append("/userdata/31289/object_detect")
+    from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
+    cfg_from_yaml_file("/userdata/31289/object_detect/tools/cfg/leap_models/baseline_polyloss_fx.yaml", cfg)
+    net = BaseBEVBackbone(cfg.MODEL.BACKBONE_2D)
+    from print_model_stat import print_model_stat
+    data = torch.randn(1, 64, 492, 432)
+    print_model_stat(net, data)
+    res = net(data)
+    print(res.shape)

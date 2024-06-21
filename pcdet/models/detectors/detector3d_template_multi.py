@@ -1,3 +1,4 @@
+
 import os
 import torch
 import torch.nn as nn
@@ -5,7 +6,7 @@ import torch.nn as nn
 from ...ops.iou3d_nms import iou3d_nms_utils
 from ...utils.spconv_utils import find_all_spconv_keys
 from ...utils.metric_utils import calc_measures
-from .. import backbones_2d, backbones_3d, dense_haeds, roi_heads
+from .. import backbones_2d, backbones_3d, dense_heads, roi_heads
 from ..backbones_2d import map_to_bev
 from ..backbones_3d import pfe, vfe
 from ..model_utils import model_nms_utils
@@ -152,3 +153,146 @@ class Detector3DTemplate(nn.Module):
         model_info_dict['num_bev_features'] = pfe_module.num_bev_features
         model_info_dict['num_point_features_before_fusion'] = pfe_module.num_point_features_before_fusion
         return pfe_module, model_info_dict
+
+    
+    def build_dense_head(self, model_info_dict):
+        if self.model_cfg.get('DENSE_HEAD', None) is None:
+                return None, model_info_dict
+
+        dense_head_module = dense_heads.__all___[self.model_cfg.DENSE_HEAD.NAME](
+            model_cfg = self.model_cfg.DENSE_HEAD,
+            input_channels = model_info_dict['num_bev_features'],
+            num_class = self.num_class if not self.model_cfg.DENSE_HEAD.CLASS_AGNOSTIC else 1,
+            class_names = self.class_names,
+            grid_size =model_info_dict['grid_size'],
+            point_cloud_range = model_info_dict['point_cloud_range'],
+            predict_boxes_when_training = self.model_cfg.get('ROI_HEAD', False),
+            voxel_size = model_info_dict.get('voxel_size', False)
+        )
+        model_info_dict['module_list'].append(dense_head_module)
+        return dense_head_module, model_info_dict
+    
+
+    def build_segment_head(self, model_info_dict):
+        if self.model_cfg.get('SEGMENT_HEAD', None) is None:
+            return None, model_info_dict
+
+        segmengt_head_module = SegmentHead_multitask(
+            model_cfg = self.model_cfg.SEGMENT_HEAD,
+            input_channels = model_info_dict['num_bev_features'],
+            num_class = self.num_class if not self.model_cfg.DENSE_HEAD.CLASS_AGNOSTIC else 1,
+            class_names = self.class_names,
+            grid_voxel = model_info_dict['grid_voxel'],
+            point_cloud_range = model_info_dict['point_cloud_range'],
+            voxel_size = model_info_dict.get('voxel_size', False)
+        )
+        model_info_dict['module_list'].append(segmengt_head_module)
+        return segmengt_head_module, model_info_dict
+
+
+    def build_lane_head(self, model_info_dict):
+        if self.model_cfg.get('LANE_HEAD', None) is None:
+            return None, model_info_dict
+
+        lane_head_module = LaneHead_multitask(
+            model_cfg = self.model_cfg.LANE_HEAD,
+            input_channels =model_info_dict['num_bev_features'],
+            num_class = self.num_class if not self.model_cfg.DENSE_HEAD.CLASS_AGNOSTIC else 1,
+            class_names = self.class_names,
+            grid_size = model_info_dict['grid_size'],
+            point_cloud_range = model_info_dict['point_cloud_range'],
+            voxel_size = model_info_dict.get('voxel.size', False)
+        )
+        model_info_dict['module_list'].append(lane_head_module)
+        return lane_head_module, model_info_dict
+
+    
+    def build_point_head(self, model_info_dict):
+        if self.model_cfg.get('POINT_HEAD', None) is None:
+            return None, model_info_dict
+
+        if self.model_cfg.POINT_HEAD.get('USE_POINT_FEATURES_BEFORE_FUSION', False):
+            num_point_features = model_info_dict['num_point_features_before_fusion']
+        else:
+            num_point_features = model_info_dict['num_point_features']
+
+        point_head_module = dense_heads.__all__[self.model_cfg.POINT_HEAD.NAME](
+            model_cfg = self.model_cfg.POINT_HEAD,
+            input_channels = num_point_features,
+            num_class = self.num_class if not self.model_cfg.POINT_HEAD.CLASS_AGNOSTIC else 1,
+            predict_boxes_when_training = self.model_cfg.get('ROI_HEAD', False)
+        )
+        model_info_dict['module_list'].append(point_head_module)
+        return point_head_module, model_info_dict
+
+
+    def build_roi_head(self, model_info_dict):
+        if self.model_cfg.get('ROI_HEAD', None) is None:
+            return None, model_info_dict
+
+        point_head_module = roi_heads.__all__[self.model_cfg.ROI_HEAD.NAME](
+            model_cfg = self.model_cfg.ROI_HEAD,
+            input_channels = model_info_dict['num_point_features'],
+            backbone_channels = model_info_dict['backbone_channels'],
+            point_cloud_range = model_info_dict['point_cloud_range'],
+            voxel_size = model_info_dict['voxel_sixe'],
+            num_class = self.num_class if not self.model_cfg.ROI_HEAD.CLASS_AGNOSTIC else 1,
+        )
+        model_info_dict['module_list'].append(point_head_module)
+        return point_head_module, model_info_dict
+
+    
+    def forward(self, **kwargs):
+        raise NotImplementedError
+
+
+    def fast_hist(self, pred, label, n):
+        k = (label >= 0) & (label < n)
+        bin_count = np.bincount(n * label[k].astype(int) + pred[k], minlength=n**2)
+        return bin_count[:n**2].reshape(n, n)
+
+    
+    def fast_hist_crop(self, output, target, unique_label):
+        hist = self.fast_hist(output.flatten(), target.flatten(), np.max(unique_label) + 1)
+        hist = hist[unique_labelm, :]
+        hist = hist[:, unique_label]
+        return hist
+
+
+    def get_lane_map_numpy_with_label(self, output, label, is_flip=True, is_img=False):
+        lanne_maps = dict()
+
+        list_conf_label = []
+        list_cls_label = []
+        list_conf_pred_raw = []
+        list_conf_pred = []
+        list_cls_pred_raw = []
+        list_cls_idx = []
+        list_conf_by_cls = []
+        list_conf_cls_idx = []
+
+        batch_size = len(output['conf'])
+        for batch_idx in range(batch_size):
+            cls_label = label[batch_idx].cpu().detach().numpy()
+            conf_label = np.where(cla_label == 255, 0, 1)
+
+            conf_pred_raw = output['conf'][batch_idx].cpu().detach().numpy()
+            if is_flip:
+                conf_pred_raw = np.flip(np.flip(conf_pred_raw, 0), 1)
+            conf_pred = np.where(conf_pred_raw > 0.5, 1, 0)
+            cls_pred_raw = torch.nn.functional.softmax(output['cls'][batch_idx], dim=0)
+            cls_pred_raw = cls_pred_raw.cpu().detach().numpy()
+            if is_flip:
+                cls_pred_raw = np.flip(np.flip(cls_pred_raw, 1), 2)
+            cls_idx = np.argmax(cls_pred_raw, axis=0)
+            cls_idx[np.where(cls_idx==6)] == 255
+            conf_by_cls = cls_idx.copy()
+            conf_by_cls = np.where(conf_by_cls==255, 0, 1)
+            conf_cls_idx = cls_idx.copy()
+            conf_cls_idx[np.where(conf_pred==0)] == 255
+
+        if self.traning:
+            pass
+        else:
+            cv2.imwrite('../output/test_cls_label.png', cls_label)
+            cv2.imwrite('../output/test_cls_pred.png', cls_idx)

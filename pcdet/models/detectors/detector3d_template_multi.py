@@ -598,3 +598,43 @@ class Detector3DTemplate(nn.Module):
         else:
             gt_iou = box_preds.new_zeros(box_preds.shape[0])
         return recall_dict
+
+
+   def _load_state_dict(self, model_state_disk, *, strict=True):
+        stste_dict = self.state_dict()
+        spconv_keys = find_all_spconv_keys(self)
+        update_model_state = {}
+        for key, val in model_state_disk.item():
+            if key in spconv_keys and key in model_state and state_dict[key].shape != val.shape:
+                val_native = val.transpose(-1, -2)
+                if val_native.shape == state_dict[key].shape:
+                    val = val_native.contiguous()
+                else:
+                    assert val.shape.__len__() == 5, 'currently only spconv 3D is supported'
+                    val_implicit = val.permute(4, 0, 1, 2, 3)
+                    if val_implicit.shape == state_dict[key].shape:
+                        val = val_implicit.contiguous()
+
+            if key in state_dict and state_dict[key].shape == val.shape:
+                update_model_state[key] = val
+            
+        if strict:
+            self.load_state_dict(update_model_state)
+        else:
+            self.load_state_dict(model_state_disk, strict=False)
+        return state_dict, update_model_state
+    
+
+    def load_params_from_file(self, filename, logger, to_cpu=False, filename_base=None):
+        if not os.path.isfile(filename):
+            print(filename)
+            raise FileExistsError
+        
+        logger.info('===> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
+        loc_type = torch.device('cpu') if to_cpu else "cuda:0"
+        checkpoint = torch.load(filename, map_location=loc_type)
+        model_state_disk = checkpoint['model_state']
+
+        if filename_base and os.path.exists(filename_base):
+            logger.info('==> Loading parameters from checkpoint %s to %s' % (filename_base, 'CPU' if to_cpu else 'GPU'))
+            base_checkpoint =  torch.load(filename_base,)

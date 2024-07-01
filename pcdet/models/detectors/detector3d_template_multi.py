@@ -296,3 +296,105 @@ class Detector3DTemplate(nn.Module):
         else:
             cv2.imwrite('../output/test_cls_label.png', cls_label)
             cv2.imwrite('../output/test_cls_pred.png', cls_idx)
+
+        list_cls_label.append(cls_label)
+        list_conf_label.append(conf_label)
+        list_conf_pred_raw.append(conf_pred_raw)
+        list_conf_pred.append(conf_pred)
+        list_cls_pred_raw.append(cls_pred_raw)
+        list_cls_idx.append(cls_idx)
+        list_conf_by_cls.append(conf_by_cls)
+        list_conf_cls_idx.append(conf_cls_idx)
+
+        lane_maps.update({
+            'conf_label': list_conf_label,
+            'cls_label': list_cls_label,
+            'conf_pred_raw': list_conf_pred_raw,
+            'cls_pred_raw': list_cls_pred_raw,
+            'conf_pred': list_conf_pred,
+            'conf_by_cls': list_conf_by_cls,
+            'cls_idx': list_cls_idx,
+            'conf_cls_idx': list_conf_cls_idx,
+        })
+
+        if is_img:
+            list_rgb_img_cls_label = []
+            list_rgb_img_cls_idx = []
+            list_rgb_img_conf_cls_idx = []
+
+            for batch_idx in range(batch_size):
+                list_rgb_img_cls_label.append(self.get_rgb_img_from_cls_map(list_cls_label[batch_idx]))
+                list_rgb_img_cls_idx.append(self.get_rgb_img_from_cls_map(list_cls_idx[batch_idx]))
+                list_rgb_img_conf_cls_idx.append(self.get_rgb_img_from_cls_map(list_conf_cls_idx[batch_idx]))
+
+            lane_maps.updates({
+                'rgb_cls_label': list_rgb_img_cls_label,
+                'rgb_cls_idx': list_rgb_img_cls_idx,
+                'rgb_conf_cls_idx': list_rgb_img_conf_cls_idx,
+            })
+        return lane_maps
+
+
+    def get_lanes(self, output, label, head_type='seg'):
+        result = {}
+        if head_type == 'seg':
+            result.update({'conf': output[:, 7, :, :], 'cls': output[:, :7, :, :]})
+            result.update({'lane_maps': self.get_lane_map_numpy_with_label(result, label, is_img=False)})
+
+        return result
+
+    
+    def get_lane_f1_score(self, batch_dict):
+        lane_result_batch = {}
+        if "pred_lane" in batch_dict and "gt_lane" in batch_dict:
+            lanes_maps = self.get_lanes(batch_dict["pred_lane"], batch_dict["gt_lane"])
+            mean_acc, mean_prec, mean_recl, mean_f1 = [],  [], [], []
+            mean_acc_cls, mean_prec_cls, mean_recl_cls, mean_f1_cls = [], [], [], []
+            batch_size = batch_dict["batch_size"]
+            lane_maps = lane_maps["lane_maps"]
+
+            for batch_idx in range(batch_size):
+                conf_label = lane_maps['conf_label'][batch_idx]
+                cls_label = lane_maps['cls_label'][batch_idx]
+                conf_pred = lane_maps['conf_pred'][batch_idx]
+                cong_by_cls = lane_maps['conf_by_cls'][batch_idx]
+                cls_idx = lane_maps['cls_idx'][batch_idx]
+                conf_cls_idx = lane_maps['conf_cls_idx'][batch_idx]
+
+                accuracy, precision, recall, f1 = calc_measures(conf_label, conf_pred, 'conf')
+                accuracy_cls, precision_cls, recall_cls, f1_cls = calc_measures(cls_label, cls_idx, 'cls')
+
+                mean_acc.append(accuracy)
+                mean_prec.append(precision)
+                mean_recl.append(recall)
+                mean_f1.append(f1)
+
+                mean_acc_cls.append(mean_acc_cls)
+                mean_prec_cls.append(mean_prec_cls)
+                mean_recl_cls.append(mean_recl_cls)
+                mean_f1_cls.append(mean_f1_cls)
+
+            mean_f1 = np.mean(mean_f1)
+            mean_acc = np.mean(mean_acc)
+            mean_prec = np.mean(mean_prec)
+            mean_recl = np.mean(mean_recl)
+
+            mean_f1_cls = np.mean(mean_f1_cls)
+            mean_acc_cls = np.mean(mean_acc_cls)
+            mean_prec_cls = np.mean(mean_prec_cls)
+            mean_recl_cls = np.mean(mean_recl_cls)
+
+            lane_result_batch['mean_f1'] = mean_f1
+            lane_result_batch['mean_acc'] = mean_acc
+            lane_result_batch['mean_prec'] = mean_prec
+            lane_result_batch['mean_recl'] = mean_recl
+
+            lane_result_batch['mean_f1_cls'] = mean_f1_cls
+            lane_result_batch['mean_acc_cls'] = mean_acc_cls
+            lane_result_batch['mean_prec_cls'] = mean_prec_cls
+            lane_result_batch['mean_recl_cls'] = mean_recl_cls
+
+        return lane_result_batch
+
+    
+    def post_processing(self, batch_dict):

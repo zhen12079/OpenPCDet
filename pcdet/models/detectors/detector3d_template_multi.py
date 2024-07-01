@@ -599,8 +599,8 @@ class Detector3DTemplate(nn.Module):
             gt_iou = box_preds.new_zeros(box_preds.shape[0])
         return recall_dict
 
-
-   def _load_state_dict(self, model_state_disk, *, strict=True):
+    
+    def _load_state_dict(self, model_state_disk, *, strict=True):
         stste_dict = self.state_dict()
         spconv_keys = find_all_spconv_keys(self)
         update_model_state = {}
@@ -637,4 +637,112 @@ class Detector3DTemplate(nn.Module):
 
         if filename_base and os.path.exists(filename_base):
             logger.info('==> Loading parameters from checkpoint %s to %s' % (filename_base, 'CPU' if to_cpu else 'GPU'))
-            base_checkpoint =  torch.load(filename_base,)
+            base_checkpoint =  torch.load(filename_base,map_location=loc_type)
+            base_model_state_disk = base_checkpoint['model_state']
+
+            for k, v in base_model_state_disk.items():
+                if 'dense_head' in k:
+                    print (k, v.shape)
+                else:
+                    model_state_disk[k] = v
+
+        version = checkpoint.get('version', None)
+        if version is not None:
+            logger.info('===> Checkpoint trained from version: %s' % version)
+            
+        
+        if self.training:
+            no_head_state_dict = {}
+            for k, v in model_state_disk.item():
+                if 'lane_head' not in k:
+                    no_head_state_dict[k] = v
+            state_dict, update_model_state = self._load_state_dict(no_head_state_dict, strict=False)
+        else:
+            state_dict, update_model_state = self._load_state_dict(model_state_disk, strict=False)
+        
+        for key in state_dict:
+            if key not in update_model_state:
+                logger.info('Not updated weight %s:%s' % (key, str(state_dict[key].shape)))
+        logger.info('===>Done (loaaded%d/%d)' % (len(update_model_state),len(state_dict)))
+
+
+
+    def load_params_with_optimizer(self, filename, to_cpu=False, optimizer=None, logger=None):
+        if not os.path.isfile(filename):
+            raise FileNotFoundError
+
+        logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
+        loc_type = torch.device('cpu') if to_cpu else None
+        checkpoint = torch.load(filename,map_location=loc_type)
+        epoch = checkpoint.get('epoch', -1)
+        it = checkpoint.get('it', 0.0)
+
+        if self.training:
+            no_head_state_dict = {}
+            for k, v in checkpoint['model_state'].items():
+                if 'lane_head' not in k:
+                    no_head_state_dict[k] = v
+            self._load_state_dict(no_head_state_dict, strict=False)
+        else:
+            self._load_state_dict(checkpoint['model_state'], strict=False)
+
+        if optimizer is not None:
+            if 'optimizer_state' in checkpoint and checkpoint['optimizer_state'] is not None:
+                logger.info('===> Loading optimizer parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
+                optimizer.load_state_dict(checkpoint['optimizer_state'])
+            else:
+                assert filename[-4] == '.', filename
+                src_file, ext = filename[:-4], filename[-3:]
+                optimizer_filename = '%s_optim.%s' % (src_file, ext)
+                if os.path.exists(optimizer_filename):
+                    optimizer_ckpt = torch.load(optimizer_filename, map_location=loc_type)
+                    optimizer.load_state_dict(optimizer_ckpt['optimizer_state']) 
+        
+        if 'version' in checkpoint:
+            print('====> checkpoint trained from version: %s' % checkpoint['version'])
+        logger.info('===>Done')
+        return it, epoch
+
+
+    def load_params_with_det_lane(self, det_filename=None, lane_ckpt=None, to_cpu=False, optimizer=None, logger=None):
+        epoch = 0
+        it = 0.0
+        if os.path.isfile(lane_ckpt):
+            logger.info('====> Loading parameters from checkpoint %s to %s' % (lane_ckpt, 'CPU' if to_cpu else 'GPU'))
+            loc_type = torch.device('cpu') if to_cpu else None
+            lane_checkpoint = torch.load(lane_checkpoint, map_location=loc_type)
+            epoch = lane_checkpoint.get('epoch' , -1)
+            it = lane_checkpoint.get('it', 0.0)
+            self._load_state_dict(lane_checkpoint['model_state'], strict=False)
+
+        if not os.path.isfile(det_filename):
+            raise FileNotFoundError
+
+        logger.info('====> Loading parameters from checkpoint %s to %s' % (det_filename, 'CPU' if to_cpu else 'GPU'))
+        loc_type =  torch.device('cpu') if to_cpu else None
+        checkpoint = torch.load(det_filename, map_location=loc_type)
+        if self.trainging:
+            no_head_state_dict = {}
+            for k, v in checkpoint['model_state'].items():
+                if 'lane_head' not in k:
+                    no_head_state_dict[k] = v
+            self._load_state_dict(no_head_state_dict, strict=False)
+        else:
+            self._load_state_dict(checkpoint['model_state'], strict=False)
+
+        if optimizer is not None:
+            if 'optimizer_state' in lane_checkpoint and lane_checkpoint['optimizer_state'] is not None:
+                logger.info('===> Loading optimizer parameters from checkpoint %s to %s' % (lane_ckpt, 'CPU' if to_cpu else 'GPU'))
+                optimizer.load_state_dict(lane_checkpoint['optimizer_state'])
+            else:
+                assert lane_ckpt[-4] == '.', lane_ckpt
+                src_file, ext = lane_ckpt[:-4], lane_ckpt[-3:]
+                optimizer_filename = '%s_optim.%s' % (src_file, ext)
+                if os.path.exists(optimizer_filename):
+                    optimizer_ckpt = torch.load(optimizer_filename, map_location=loc_type)
+                    optimizer.load_state_dict(optimizer_ckpt['optimizer_state']) 
+        
+        if 'version' in checkpoint:
+            print('====> checkpoint trained from version: %s' % checkpoint['version'])
+        logger.info('===>Done')
+        return it, epoch

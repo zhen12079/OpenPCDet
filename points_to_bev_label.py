@@ -41,3 +41,28 @@ def points_to_bev_label(file, label_file, list_roi_xyz=[0.0, 69.12, -21.6, 21,6,
 
     filp_img = np.filp(np.filp(label_img, 0), 1).copy()
     return filp_img
+
+def beving_from_points(self, lane_data):
+    laneline_type = [1, 4]
+    road_boundary_type = [3, 4]
+    bev_range = [69.12, 0.0, 20.16, -20.16]
+    grid_size = [0.48, 0.28]
+    x_max, x_min, y_max, y_min = bev_range
+    grid_x, grid_y = grid_size
+    bev_img_h, bev_img_w = int((x_max- x_min) / grid_x), int((y_max - y_min) / gird_y)
+    bev_img = np.full((bev_img_h, bev_img_w), 255, dtype=np.uint8)
+
+    for lm in lane_data['lanemarking']:
+        pts = np.array(lm['points'])
+        for i in range(len(pts) - 1):
+            p1_x = int((-pts[i][1] - y_min) // grid_y)
+            p1_y = int((-pts[i][0] - x_max) // grid_x)
+            p2_x = int((-pts[i+1][1] - y_min) // grid_y)
+            p2_y = int((-pts[i+1][0] - x_max) // grid_x)
+            if pts[i+1][3] in laneline_type:
+                cv2.line(bev_img, (p1_x, p1_y), (p2_x, p2_y), 0, 1)
+            if pts[i+1][3] in road_boundary_type:
+                cv2.line(bev_img,  (p1_x, p1_y), (p2_x, p2_y), 1, 1)
+
+    return bev_img
+

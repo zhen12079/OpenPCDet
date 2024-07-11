@@ -1,0 +1,27 @@
+from torch import nn
+import torch
+from torch.nn import functional as F
+
+class focal_loss(nn.Module):
+    def __init__(self, alpha=None, gamma=2, size_average=True):
+        super(focal_loss,self).__init__()
+        self.size_average = size_average
+        self.alpha = torch.Tensor(alpha)
+        self.gamma = gamma
+
+    def forward(self, preds, labels):
+        self.alpha = self.alpha.to(preds.device)
+        preds_logsoft = F.log_softmax(preds,dim=1)
+        preds_softmax = torch.exp(preds_logsoft)
+
+        preds_softmax = preds_softmax.gather(1,labels.view(-1,1))
+        preds_logsoft = preds_logsoft.gather(1,labels.view(-1,1))
+        self.alpha = self.alpha.gather(0,labels.view(-1))
+        loss = -torch.mul(torch.pow((1-preds_softmax),self.gamma),preds_logsoft)
+        loss = torch.mul(self.alpha,loss.t())
+        if self.size_average:
+            loss=loss.mean()
+        else:
+            loss=loss.sum()
+        return loss
+

@@ -1,0 +1,313 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .vfe_template import VFETemplate
+
+class PFNLayer(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 use_norm=True,
+                 last_layer=False):
+        super().__init__()
+
+        self.last_vfe = last_layer
+        self.use_norm = use_norm
+        if not self.last_vfe:
+            out_channels = out_channels // 2
+
+        if self.use_norm:
+            # self.linear = nn.Linear(in_channels, out_channels, bias=False)
+            self.linear = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            # self.norm = nn.BatchNorm1d(out_channels, eps=1e-3, momentum=0.01)
+            self.norm = nn.BatchNorm2d(out_channels, eps=1e-5, momentum=0.1)
+        else:
+            self.linear = nn.Linear(in_channels, out_channels, bias=True)
+
+
+    def forward(self, inputs):
+
+        # inputs = inputs.permute(0, 2, 1)    
+        # inputs = inputs.unsqueeze(-1)
+        x = self.linear(inputs)  # [1,64,32,21463] -> [21463,64,32,1]
+
+        torch.backends.cudnn.enabled = False
+
+        x = self.norm(x) if self.use_norm else x  # [1,64,32,21463] -> [21463,64,32,1]
+        x = x.squeeze(-1)
+        x = x.permute(0, 2, 1)
+
+        torch.backends.cudnn.enabled = True
+        x = F.relu(x)
+
+        x_max = torch.max(x, dim=1, keepdim=True)[0]
+
+        if self.last_vfe:
+            return x_max
+        else:
+            x_repeat = x_max.repeat(1, inputs.shape[1], 1)
+            x_concatenated = torch.cat([x, x_repeat], dim=2)
+            return x_concatenated
+
+class PALayer(nn.Module):
+    def __init__(self, dim_pa, reduction_pa):
+        super(PALayer, self).__init__()
+        # self.fc = nn.Sequential(
+        #     nn.Linear(dim_pa, dim_pa // reduction_pa),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(dim_pa // reduction_pa, dim_pa)
+        # )
+        self.fc = nn.Sequential(
+            nn.Conv2d(dim_pa, dim_pa // reduction_pa, kernel_size=1, bias=False),
+            # nn.BatchNorm2d(out_channels, eps=1e-5, momentum=0.1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_pa // reduction_pa, dim_pa, kernel_size=1, bias=False)
+            # nn.BatchNorm2d(out_channels, eps=1e-5, momentum=0.1)
+        )
+
+    def forward(self, x):
+        b, w, _ = x.size() #[35308, 32, 11]
+        y = torch.max(x, dim=2, keepdim=True)[0].view(b, w,1,1) #y:[35308, 32]
+        out1 = self.fc(y).view(b, w, 1) #out1:[35308, 32, 1]
+        # import pdb;pdb.set_trace()
+        return out1
+
+
+# Channel-wise attention for each voxel
+class CALayer(nn.Module):
+    def __init__(self, dim_ca, reduction_ca):
+        super(CALayer, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Conv2d(dim_ca, dim_ca // reduction_ca, kernel_size=1, bias=False),
+            # nn.BatchNorm2d(out_channels, eps=1e-5, momentum=0.1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_ca // reduction_ca, dim_ca, kernel_size=1, bias=False),
+            # nn.BatchNorm2d(out_channels, eps=1e-5, momentum=0.1)
+        )
+
+    def forward(self, x):
+        b, _, c = x.size()
+        y = torch.max(x, dim=1, keepdim=True)[0].view(b, c,1,1)
+        y = self.fc(y).view(b, 1, c)
+        return y
+
+
+# Point-wise attention for each voxel
+class PACALayer(nn.Module):
+    def __init__(self, dim_ca, dim_pa, reduction_r):
+        super(PACALayer, self).__init__()
+        self.pa = PALayer(dim_pa,  dim_pa // reduction_r)
+        self.ca = CALayer(dim_ca,  dim_ca // reduction_r)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        pa_weight = self.pa(x)
+        ca_weight = self.ca(x)
+        paca_weight = torch.mul(pa_weight, ca_weight)
+        paca_normal_weight = self.sig(paca_weight)
+        out = torch.mul(x, paca_normal_weight)
+        
+        return out, paca_normal_weight
+
+# Voxel-wise attention for each voxel
+class VALayer(nn.Module):
+    def __init__(self, c_num, p_num):
+        super(VALayer, self).__init__()
+        self.fc1 = nn.Sequential(
+            # nn.Linear(c_num + 3, 1),
+            nn.Conv2d(c_num + 3, 1, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+        self.fc2 = nn.Sequential(
+            nn.Conv2d(p_num, 1, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+        self.sigmod = nn.Sigmoid()
+
+    def forward(self, voxel_center, paca_feat):
+        '''
+        :param voxel_center: size (K,1,3)
+        :param SACA_Feat: size (K,N,C)
+        :return: voxel_attention_weight: size (K,1,1)
+        '''
+        voxel_center_repeat = voxel_center.repeat(1, paca_feat.shape[1], 1)
+        # print(voxel_center_repeat.shape)
+        voxel_feat_concat = torch.cat([paca_feat, voxel_center_repeat], dim=-1)  # K,N,C---> K,N,(C+3)
+        k,n,c=voxel_feat_concat.shape
+        voxel_feat_concat = voxel_feat_concat.view(k*n,c,1,1)
+        feat_2 = self.fc1(voxel_feat_concat)  # K,N,(C+3)--->K,N,1
+        feat_2=feat_2.view(k,n,1,1)
+        # feat_2 = feat_2.permute(0, 2, 1).contiguous()  # K,N,1--->K,1,N
+
+        voxel_feat_concat = self.fc2(feat_2)  # K,1,N--->K,1,1
+        voxel_feat_concat=voxel_feat_concat.view(k,1,1)
+        voxel_attention_weight = self.sigmod(voxel_feat_concat)  # K,1,1
+        
+        return voxel_attention_weight
+
+class VoxelFeature_TA(nn.Module):
+    def __init__(self, model_cfg):
+        super().__init__()
+        self.model_cfg = model_cfg
+        dim_ca = self.model_cfg.TA.INPUT_C_DIM
+        dim_pa = self.model_cfg.TA.NUM_POINTS_IN_VOXEL
+        reduction_r = self.model_cfg.TA.REDUCTION_R
+        boost_c_dim = self.model_cfg.TA.BOOST_C_DIM
+        use_paca_weight = self.model_cfg.TA.USE_PACA_WEIGHT
+        # self.PACALayer1 = PACALayer(dim_ca=dim_ca, dim_pa=dim_pa, reduction_r=reduction_r)
+        # self.PACALayer2 = PACALayer(dim_ca=boost_c_dim, dim_pa=dim_pa, reduction_r=reduction_r)
+        self.voxel_attention1 = VALayer(c_num=dim_ca, p_num=dim_pa)
+        # self.voxel_attention2 = VALayer(c_num=boost_c_dim, p_num=dim_pa)
+        self.use_paca_weight = use_paca_weight
+        self.FC1 = nn.Sequential(
+            # nn.Linear(2*dim_ca, boost_c_dim),
+            nn.Conv2d(2*dim_ca, boost_c_dim, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        # self.FC2 = nn.Sequential(
+        #     # nn.Linear(boost_c_dim, boost_c_dim),
+        #     nn.Conv2d(boost_c_dim, boost_c_dim, kernel_size=1, bias=True),
+        #     nn.ReLU(inplace=True),
+        # )
+    
+    def forward(self, voxel_center, x):
+        # point_attention an channel_attention -> PACALayer
+        # import pdb; pdb.set_trace()
+        # paca1,paca_normal_weight1 = self.PACALayer1(x) #x:[25336, 32, 11] paca1:[25336, 32, 11] paca_normal_weight1:[25336, 32, 11]
+        paca1 = x
+        # voxel_attention
+        voxel_attention1 = self.voxel_attention1(voxel_center, paca1) #voxel_center:[25336, 1, 3] voxel_attention1:[25336, 1, 1]
+        if self.use_paca_weight:
+            paca1_feat = voxel_attention1 * paca1 * paca_normal_weight1
+        else:
+            paca1_feat = voxel_attention1 * paca1 #paca1_feat:[25336, 32, 11]
+        out1 = torch.cat([paca1_feat, x], dim=2).permute(0,2,1).unsqueeze(-1).contiguous() #out1:[25336, 32, 22]>[25336, 22, 32,1]
+        out1 = self.FC1(out1) #out1:[25336, 32, 64] > [25336, 64, 32,1]
+        # 缩小vfeta
+        # out1 = out1.squeeze().permute(0,2,1).contiguous()
+
+        # paca2,paca_normal_weight2 = self.PACALayer2(out1) #paca2:[25336, 32, 64] paca_normal_weight2:[25336, 32, 64]
+        # voxel_attention2 = self.voxel_attention2(voxel_center, paca2) #voxel_attention2:[25336, 1, 1]
+        # if self.use_paca_weight:
+        #     paca2_feat = voxel_attention2 * paca2 * paca_normal_weight2
+        # else:
+        #     paca2_feat = voxel_attention2 * paca2 #paca2_feat:[25336, 32, 64]
+        # out2 = out1 + paca2_feat #out2:[25336, 32, 64]
+        # out2 = out2.permute(0,2,1).unsqueeze(-1).contiguous()
+        # out = self.FC2(out2) #out:[25336, 32, 64]> [25336, 64, 32,1]
+        # import pdb;pdb.set_trace()
+        return out1
+
+
+class PillarVFE_TA_va(VFETemplate):
+    def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range, **kwargs):
+        super().__init__(model_cfg=model_cfg)
+
+        self.use_norm = self.model_cfg.USE_NORM
+        self.with_distance = self.model_cfg.WITH_DISTANCE
+        self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
+        num_point_features += 6 if self.use_absolute_xyz else 3
+        self.with_num_points = self.model_cfg.get('WITH_NUM_POINTS', False)
+        if self.with_distance:
+            num_point_features += 1
+
+        if self.with_num_points:
+            num_point_features += 1
+        self.num_filters = self.model_cfg.NUM_FILTERS
+        assert len(self.num_filters) > 0
+        num_filters = [64] + list(self.num_filters)
+        self.VoxelFeature_TA = VoxelFeature_TA(model_cfg=model_cfg)
+
+        pfn_layers = []
+        for i in range(len(num_filters) - 1):
+            in_filters = num_filters[i]
+            out_filters = num_filters[i + 1]
+            pfn_layers.append(
+                PFNLayer(in_filters, out_filters, self.use_norm, last_layer=(i >= len(num_filters) - 2))
+            )
+        self.pfn_layers = nn.ModuleList(pfn_layers)
+
+        self.voxel_x = voxel_size[0]
+        self.voxel_y = voxel_size[1]
+        self.voxel_z = voxel_size[2]
+        self.x_offset = self.voxel_x / 2 + point_cloud_range[0]
+        self.y_offset = self.voxel_y / 2 + point_cloud_range[1]
+        self.z_offset = self.voxel_z / 2 + point_cloud_range[2]
+
+    def get_output_feature_dim(self):
+        return self.num_filters[-1]
+
+    def get_paddings_indicator(self, actual_num, max_num, axis=0):
+        actual_num = torch.unsqueeze(actual_num, axis + 1)
+        max_num_shape = [1] * len(actual_num.shape)
+        max_num_shape[axis + 1] = -1
+        max_num = torch.arange(max_num, dtype=torch.int, device=actual_num.device).view(max_num_shape)
+        paddings_indicator = actual_num.int() > max_num
+        return paddings_indicator
+
+    def forward(self, batch_dict, **kwargs):
+        # import pdb;pdb.set_trace()
+        voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict[
+            'voxel_coords']
+        if self.model_cfg.get('FlITER_POINT', False):
+            indices = voxel_num_points > 3
+            voxel_features = voxel_features[indices]
+            voxel_num_points = voxel_num_points[indices]
+            coords = coords[indices]
+            batch_dict['voxel_coords'] = batch_dict['voxel_coords'][indices]
+        # import pdb;pdb.set_trace()
+        points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(
+            -1, 1, 1)
+        f_cluster = voxel_features[:, :, :3] - points_mean
+
+        f_center = torch.zeros_like(voxel_features[:, :, :3])
+        f_center[:, :, 0] = voxel_features[:, :, 0] - (
+                    coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
+        f_center[:, :, 1] = voxel_features[:, :, 1] - (
+                    coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
+        f_center[:, :, 2] = voxel_features[:, :, 2] - (
+                    coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
+
+        if self.use_absolute_xyz:
+            features = [voxel_features, f_cluster, f_center]
+        else:
+            features = [voxel_features[..., 3:], f_cluster, f_center]
+
+        # if self.use_absolute_xyz:
+        #     features = [voxel_features, f_cluster]
+        # else:
+        #     features = [voxel_features[..., 3:], f_cluster]
+
+        if self.with_distance:
+            points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
+            features.append(points_dist)
+
+        if self.with_num_points:
+            voxel_num_features = 1.0 * voxel_num_points / self.model_cfg.MAX_POINTS_PER_VOXEL
+            voxel_num_features = voxel_num_features.unsqueeze(dim=1)
+            voxel_num_features = voxel_num_features.repeat(1, self.model_cfg.MAX_POINTS_PER_VOXEL).unsqueeze(dim=2)
+            features.append(voxel_num_features)
+        features = torch.cat(features, dim=-1)
+
+
+        voxel_count = features.shape[1]
+        mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
+        mask = torch.unsqueeze(mask, -1).type_as(voxel_features)
+        features *= mask
+
+        # points_mean = points_mean.half()
+        # features = features.half()
+        # points_mean = points_mean.float()
+        # features = features.float()
+        # import pdb;pdb.set_trace()
+
+        features = self.VoxelFeature_TA(points_mean, features)
+
+        for pfn in self.pfn_layers:
+            features = pfn(features)
+        features = features.squeeze()
+        batch_dict['pillar_features'] = features
+
+        return batch_dict

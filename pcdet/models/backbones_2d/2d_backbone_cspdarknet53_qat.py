@@ -1,0 +1,220 @@
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+import math
+from collections import OrderedDict
+import numpy as np
+import torch.onnx
+# from torch.cuda.amp import autocast as autocast
+
+from pytorch_quantization import nn as quant_nn
+from pytorch_quantization import calib, tensor_quant
+from pytorch_quantization.tensor_quant import QuantDescriptor
+quant_desc_input=QuantDescriptor(calib_method='histogram')
+quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+quant_nn.QuantConvTranspose2d.set_default_quant_desc_input(quant_desc_input)
+quant_nn.TensorQuantizer.use_fb_fake_quant=True
+
+# Mish激活函数: f(x) = x * tanh(log(1 + e^x))
+# pytorch中F.softplus(x)等同于torch.log(1 + torch.exp(x))
+class Mish(nn.Module):
+    def __init__(self):
+        super(Mish, self).__init__()
+
+    def forward(self, x):
+        # x * torch.tanh(torch.log(1 + torch.exp(x)))
+        return x * torch.tanh(F.softplus(x))
+
+
+# 卷积块
+# conv + batchnormal + mish
+class BasicConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1):
+        super(BasicConv, self).__init__()
+
+        # yolov4中只有1x1、3x3卷积, 1x1 padding=0, 3x3 padding=1, 卷积操作默认bias=False
+        self.conv = quant_nn.QuantConv2d(in_channels=in_channels,
+                              out_channels=out_channels,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=kernel_size // 2,
+                              bias=False)
+
+        self.bn = nn.BatchNorm2d(out_channels)
+
+        # self.activation = Mish()
+        self.activation = nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.activation(x)
+
+        return x
+
+
+# CSPDarknet结构块的组成部分，内部堆叠的残差块
+class Resblock(nn.Module):
+    def __init__(self, channels, hidden_channels=None):
+        super(Resblock, self).__init__()
+
+        if hidden_channels is None:
+            hidden_channels = channels
+        self.res_quantizer = quant_nn.TensorQuantizer(tensor_quant.QUANT_DESC_8BIT_PER_TENSOR)
+        self.block = nn.Sequential(
+            BasicConv(in_channels=channels, out_channels=hidden_channels, kernel_size=1),
+            BasicConv(in_channels=hidden_channels, out_channels=channels, kernel_size=3),
+        )
+
+    def forward(self, x):
+        return self.res_quantizer(x) + self.block(x)
+
+
+# CSPNet
+# 存在一个残差边，这个残差边绕过了很多残差结构
+class ResblockBody(nn.Module):
+    def __init__(self, in_channels, out_channels, num_blocks, first,stride):
+        super(ResblockBody, self).__init__()
+
+        self.downsample_conv = BasicConv(in_channels, out_channels, 3, stride=stride)
+
+        if first:
+            self.split_conv0 = BasicConv(in_channels=out_channels, out_channels=out_channels, kernel_size=1)
+            self.split_conv1 = BasicConv(in_channels=out_channels, out_channels=out_channels, kernel_size=1)
+            self.blocks_conv = nn.Sequential(
+                Resblock(channels=out_channels, hidden_channels=out_channels // 2),
+                BasicConv(in_channels=out_channels, out_channels=out_channels, kernel_size=1)
+            )
+
+            self.concat_conv = BasicConv(in_channels=out_channels * 2, out_channels=out_channels, kernel_size=1)
+
+
+        else:
+            self.split_conv0 = BasicConv(in_channels=out_channels, out_channels=out_channels // 2, kernel_size=1)
+            self.split_conv1 = BasicConv(in_channels=out_channels, out_channels=out_channels // 2, kernel_size=1)
+
+            self.blocks_conv = nn.Sequential(
+                *[Resblock(channels=out_channels // 2) for _ in range(num_blocks)],
+                BasicConv(in_channels=out_channels // 2, out_channels=out_channels // 2, kernel_size=1)
+            )
+
+            self.concat_conv = BasicConv(in_channels=out_channels, out_channels=out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x = self.downsample_conv(x)
+        x0 = self.split_conv0(x)
+        x1 = self.split_conv1(x)
+        x1 = self.blocks_conv(x1)
+
+        x = torch.cat([x1, x0], dim=1)
+        x = self.concat_conv(x)
+
+        return x
+
+
+# CSPDarknet
+class CSPDarknet53_qat(nn.Module):
+    def __init__(self, model_cfg=None, input_channels=64):
+        super(CSPDarknet53_qat, self).__init__()
+        self.model_cfg = model_cfg
+        self.layers = self.model_cfg.LAYER_NUMS if hasattr(model_cfg,"LAYER_NUMS") else [1, 2, 4, 8, 4]
+        self.deblocks = nn.ModuleList()
+        self.inplanes = self.model_cfg.INPLANES if hasattr(model_cfg,"INPLANES") else 64
+        self.conv1 = BasicConv(input_channels, self.inplanes, kernel_size=3, stride=1)
+        self.feature_channels = self.model_cfg.FEATURE_CHANNELS if hasattr(model_cfg,"FEATURE_CHANNELS") else [64, 64, 64, 128, 256]
+        upsample_strides = self.model_cfg.UPSAMPLE_STRIDES if hasattr(model_cfg,"UPSAMPLE_STRIDES") else [1,2,4]
+        num_filters = self.model_cfg.NUM_FILTERS if hasattr(model_cfg,"NUM_FILTERS") else [64, 128, 256]
+        num_upsample_filters = self.model_cfg.NUM_UPSAMPLE_FILTERS if hasattr(model_cfg,"NUM_UPSAMPLE_FILTERS") else [128, 128, 128]
+        for idx in range(len(upsample_strides)):
+            self.deblocks.append(nn.Sequential(
+                nn.ConvTranspose2d(
+                    num_filters[idx], num_upsample_filters[idx],
+                    upsample_strides[idx],
+                    stride=upsample_strides[idx], bias=False
+                ),
+                nn.BatchNorm2d(num_upsample_filters[idx], eps=1e-3, momentum=0.01),
+                nn.ReLU()
+            ))
+        self.stages = nn.ModuleList([
+            ResblockBody(self.inplanes, self.feature_channels[0], self.layers[0], first=True,stride=1),
+            ResblockBody(self.feature_channels[0], self.feature_channels[1], self.layers[1], first=False, stride=1),
+            ResblockBody(self.feature_channels[1], self.feature_channels[2], self.layers[2], first=False,stride=2),
+            ResblockBody(self.feature_channels[2], self.feature_channels[3], self.layers[3], first=False,stride=2),
+            ResblockBody(self.feature_channels[3], self.feature_channels[4], self.layers[4], first=False,stride=2)
+        ])
+
+        # 进行权值初始化
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.ConvTranspose2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+
+        # def weights_init(m):
+        #     classname = m.__class__.__name__
+        #     if classname.find('Conv2d') != -1:
+        #         nn.init.xavier_normal_(m.weight.data)#kaiming_normal_
+        #         nn.init.constant_(m.bias.data, 0.0)
+        #     elif classname.find('Linear') != -1:
+        #         nn.init.xavier_normal_(m.weight)
+        #         nn.init.constant_(m.bias, 0.0)
+        # net.apply(weights_init)
+        self.num_bev_features = sum(num_upsample_filters)
+
+    # @autocast()
+    def forward(self, data_dict):
+        if isinstance(data_dict, dict):
+            x = data_dict['spatial_features']
+        else:
+            x = data_dict
+        # print(x.shape)
+        x = self.conv1(x)
+        x = self.stages[0](x)
+        x = self.stages[1](x)
+        out1 = self.stages[2](x)
+        out2 = self.stages[3](out1)
+        out3 = self.stages[4](out2)
+
+        x = torch.cat([self.deblocks[0](out1),self.deblocks[1](out2),self.deblocks[2](out3)], dim=1)
+        # print(x.shape)
+
+        if isinstance(data_dict, dict):
+            data_dict['spatial_features_2d'] = x
+        else:
+            data_dict = x
+        return data_dict
+
+
+
+if __name__ == "__main__":
+
+    import sys
+    sys.path.append("/userdata/31289/object_detect")
+    from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
+    cfg_from_yaml_file("/userdata/31289/object_detect/tools/cfgs/leap_models/baseline_polyloss_fx.yaml", cfg)
+
+    net = CSPDarknet53(cfg.MODEL.BACKBONE_2D)
+    from print_model_stat import print_model_stat
+    data = torch.randn(1,64, 496, 432)
+    print_model_stat(net,data)
+    # res = net(data)
+    # print(res.shape)
+    # for k, v in net.named_parameters():
+    #     print(k)
+    # model = load_model(net, './weights/CSPDarknet53.pth')
+    # net.eval()
+    # print(net)
+    # data = torch.randn(4, 64, 496, 432)
+    # data_dict = {}
+    # data_dict['spatial_features'] = data
+    # data_dict_result = net(data_dict)
+    # print(data_dict_result["spatial_features_2d"].shape)
+    # torch.onnx.export(net, data, "backbone_CSPDarknet53.onnx", verbose=True, input_names=['input'], output_names=['output'])
+    # print(data_dict_result)
+

@@ -1,0 +1,551 @@
+import sys
+sys.path.insert(0, '../')
+import argparse
+from pathlib import Path
+from pcdet.datasets import build_dataloader
+from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file
+from pcdet.models import build_network, load_data_to_gpu
+from pcdet.utils import common_utils
+from tqdm import tqdm
+import torch
+import rospy
+from std_msgs.msg import Header
+from sensor_msgs.msg import PointCloud2, PointField, Image
+from visualization_msgs.msg import MarkerArray, Marker
+import numpy as np
+import time
+import math
+import os
+import pickle
+import cv2
+from geometry_msgs.msg import Point
+
+class BBox3D:
+    def __init__(self, x, y, z, h, w, l, rotation):
+        """
+            3D BBox in LIDAR Coordiantes
+        """
+        self.pos = (x,y,z)
+        self.dims = (h,w,l)
+        self.x = x
+        self.y = y
+        self.z = z
+        self.height = h # z length 20
+        self.width  = w # y length 10
+        self.length = l # x length 50
+        self.rotation = rotation
+class LabelObject:
+    def __init__(self, bbox_3d, score,label):
+        self.bbox_3d = bbox_3d
+        self.label = label
+        self.score = score
+
+class Detector:
+    def __init__(self) -> None:
+        rospy.init_node('pillar_node', anonymous=True)
+        # self.pcl_pub = rospy.Publisher('pillar_infer', PointCloud2, queue_size=1)
+        # rviz_box_publisher = rospy.Publisher("pillar_detect", MarkerArray, queue_size=1)
+        self.marker_pub = rospy.Publisher("multi_task_detect", MarkerArray, queue_size=1)
+
+    def rotz(self, t):
+        c = np.cos(t)
+        s = np.sin(t)
+        return np.array([[c, -s, 0],
+                        [s, c, 0],
+                        [0, 0, 1]])
+
+    def get_3d_box(self, center, box_size, heading_angle):
+        R = self.rotz(heading_angle)
+        l, w, h = box_size
+        x_corners = [l/2, l/2, -l/2, -l/2, l/2, l/2, -l/2, -l/2]
+        y_corners = [w/2, -w/2, -w/2, w/2, w/2, -w/2, -w/2, w/2]
+        z_corners = [h/2, h/2, h/2, h/2, -h/2, -h/2, -h/2, -h/2]
+        corners_3d = np.dot(R, np.vstack([x_corners, y_corners, z_corners]))
+        corners_3d[0, :] = corners_3d[0, :] + center[0]
+        corners_3d[1, :] = corners_3d[1, :] + center[1]
+        corners_3d[2, :] = corners_3d[2, :] + center[2]
+        corners_3d = np.transpose(corners_3d)
+        return corners_3d
+
+    def boxes_to_corners_3d(self, boxes3d):
+        """
+        7 -------- 4
+        /|         /|
+        6 -------- 5 .
+        | |        | |
+        . 3 -------- 0
+        |/         |/
+        2 -------- 1
+        Args:
+            boxes3d:  (N, 7) [x, y, z, dx, dy, dz, heading], (x, y, z) is the box center
+
+        Returns:
+        """
+        boxes3d, is_numpy = common_utils.check_numpy_to_torch(boxes3d)
+        template = boxes3d.new_tensor((
+            [1, 1, -1], [1, -1, -1], [-1, -1, -1], [-1, 1, -1],
+            [1, 1, 1], [1, -1, 1], [-1, -1, 1], [-1, 1, 1],
+        )) / 2
+
+        corners3d = boxes3d[:, None, 3:6].repeat(1, 8, 1) * template[None, :, :]
+        corners3d = common_utils.rotate_points_along_z(corners3d.view(-1, 8, 3), boxes3d[:, 6]).view(-1, 8, 3)
+        corners3d += boxes3d[:, None, 0:3]
+        # corners3d = corners3d.transpose(2,1).ravel()
+        return corners3d.numpy() if is_numpy else corners3d
+
+    def rotate_points_along_z(points, angle):
+        """
+        Args:
+            points: (B, N, 3 + C)
+            angle: (B), angle along z-axis, angle increases x ==> y
+        Returns:
+
+        """
+        points, is_numpy = check_numpy_to_torch(points)
+        angle, _ = check_numpy_to_torch(angle)
+
+        cosa = torch.cos(angle)
+        sina = torch.sin(angle)
+        zeros = angle.new_zeros(points.shape[0])
+        ones = angle.new_ones(points.shape[0])
+        rot_matrix = torch.stack((
+            cosa,  sina, zeros,
+            -sina, cosa, zeros,
+            zeros, zeros, ones
+        ), dim=1).view(-1, 3, 3).float()
+        points_rot = torch.matmul(points[:, :, 0:3], rot_matrix)
+        points_rot = torch.cat((points_rot, points[:, :, 3:]), dim=-1)
+        return points_rot.numpy() if is_numpy else points_rot
+    
+    def display(self, boxes, lines, labels, color_dict):
+        self.marker_array = MarkerArray()
+        marker = Marker()
+        marker.action = Marker.DELETEALL
+        self.marker_array.markers.append(marker)
+        for obid in range(len(boxes)):
+            marker = Marker()
+            marker.header.frame_id = 'multi_task'
+            marker.id = obid
+            marker.action = Marker.ADD
+            marker.type = Marker.LINE_LIST
+            ob = boxes[obid]
+            ###############################################
+            ob = ob.transpose(1,0).ravel()
+            # import pdb; pdb.set_trace()
+            tib = 0
+            detect_points_set = []
+            for i in range(0, 8):
+                detect_points_set.append(Point(ob[i], ob[i+8], ob[i+16]))
+
+            marker.color.r = color_dict[labels[obid]][0]
+            marker.color.g = color_dict[labels[obid]][1]
+            marker.color.b = color_dict[labels[obid]][2]
+
+            marker.color.a = 1
+            marker.scale.x = 0.1
+            marker.points = []
+            # lines = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
+            #  [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]]
+            for line in lines:
+                marker.points.append(detect_points_set[line[0]])
+                marker.points.append(detect_points_set[line[1]])
+            self.marker_array.markers.append(marker)
+        # import pdb; pdb.set_trace()
+        self.marker_pub.publish(self.marker_array)
+
+
+class Ground_trues(Detector):
+    def __init__(self) -> None:
+        super().__init__()
+        rospy.init_node('pillar_node', anonymous=True)
+        # self.pcl_pub = rospy.Publisher('pillar_infer', PointCloud2, queue_size=1)
+        # rviz_box_publisher = rospy.Publisher("pillar_detect", MarkerArray, queue_size=1)
+        self.marker_pub = rospy.Publisher("gt_labels", MarkerArray, queue_size=1)
+
+
+def parse_config():
+    parser = argparse.ArgumentParser(description='arg parser')
+    parser.add_argument('--cfg_file', type=str, default='/userdata/31289/object_detect/output/leap_models/fx_hesai_6cls_point48_smallvfe_headup/finetune_hesaiv3.0_vta_headup_61010_pt48_changematch/hesai_vta_headup_61010_pt48_zy.yaml')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--ckpt', type=str, default="/userdata/31289/object_detect/output/leap_models/fx_hesai_6cls_point48_smallvfe_headup/finetune_hesaiv3.0_vta_headup_61010_pt48_changematch/ckpt/checkpoint_epoch_80.pth")
+    parser.add_argument('--pcds', type=str, default="/groupdata/share/openset/leap_data/LEAP_DETECTION_DATASET_FACTORY/WRONG_DATA/fix_issue_hesai_42022/pcd")
+    parser.add_argument('--images', type=str, default=None)
+    parser.add_argument('--workers',type=int, default=4)
+    parser.add_argument('--pcd2json_path', type=str, default=None)
+    args = parser.parse_args()
+    return args
+
+def pointpillars_output_to_label_objects(pre_dicts,score_fiter):
+    predictions = pre_dicts[0]
+    n = len(predictions['pred_labels'])
+    # print(predictions)
+    leap_objects = []
+    for i in range(n):
+        label = list(score_fiter.keys())[predictions['pred_labels'][i]-1]
+        location = predictions['pred_boxes'][i][:3]
+        dims = predictions['pred_boxes'][i][3:6]
+        rotation = predictions['pred_boxes'][i][6:]
+        score = predictions['pred_scores'][i]
+        # 此处可以加分数过滤
+        if score < score_fiter[label]:
+           continue
+        box3d = BBox3D(location[0], location[1], location[2], dims[0], dims[1], dims[2], rotation)
+        leap_object = LabelObject(box3d, score,label)
+
+        leap_objects.append(leap_object)
+    leap_objects = sorted(leap_objects,key=lambda x:x.bbox_3d.x)
+    # import pdb;pdb.set_trace()
+    return leap_objects
+
+def gt_infos_to_label_objects(gt_annos, frame_id):
+    gt_label = gt_annos[frame_id]
+    n = len(gt_label['name'])
+    # print(predictions)
+    gt_objects = []
+    for i in range(n):
+        label = gt_label['name'][i]
+        location = gt_label['location'][i]
+        dims = gt_label['dimensions'][i]
+        rotation = gt_label['rotation_y'][i][0]
+
+        score = 1
+        box3d = BBox3D(location[0], location[1], location[2], dims[0], dims[1], dims[2], rotation)
+        gt_object = LabelObject(box3d, score,label)
+
+        gt_objects.append(gt_object)
+    gt_objects = sorted(gt_objects,key=lambda x:x.bbox_3d.x)
+    return gt_objects
+
+
+def convert_prediction_to_rviz_box(pred:LabelObject):
+        rviz_box = Marker()
+
+        # rviz_box.action = Marker.DELETEALL
+        box = pred.bbox_3d
+        rviz_box.pose.position.x = box.x
+        rviz_box.pose.position.y = box.y
+        rviz_box.pose.position.z = box.z                
+        rviz_box.scale.x = box.length
+        rviz_box.scale.y = box.width
+        rviz_box.scale.z = box.height
+        # ref https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles
+        rviz_box.pose.orientation.x = 0
+        rviz_box.pose.orientation.y = 0
+        rviz_box.pose.orientation.z = math.sin(box.rotation/2)
+        rviz_box.pose.orientation.w = math.cos(box.rotation/2)
+
+        rviz_box.type = Marker.CUBE
+        rviz_box.action = Marker.ADD
+        # rviz_box.lifetime = rospy.Duration(0)
+        # rviz_box.header.stamp = rospy.Time.now()
+
+        rviz_box.header.frame_id = 'multi_task'
+        rviz_box.color.r = 255
+        rviz_box.color.b = 255
+        rviz_box.color.g = 255
+        rviz_box.color.a = 0.4
+        return rviz_box
+
+def get_infos(sample_idx):
+    cls = []
+    headings = []
+    positions = []
+    scales = []
+
+    if headings == []:
+        headings.append([0.1])
+        positions.append([0, 0, 0])
+        scales.append([1, 1, 1])
+        cls.append("Car")
+
+    headings = np.array(headings, dtype=np.float32)
+    positions = np.array(positions, dtype=np.float32)
+    scales = np.array(scales, dtype=np.float32)
+
+    info = {}
+    pc_info = {'num_features': 4, 'lidar_idx': sample_idx}
+    info['point_cloud_info'] = pc_info
+    annotations = {}
+    annotations['name'] = cls
+    annotations['dimensions'] = scales
+    annotations['location'] = positions
+    annotations['rotation_y'] = headings
+
+    gt_boxes_lidar = np.concatenate([positions, scales, headings], axis=1)
+    annotations['gt_boxes'] = gt_boxes_lidar
+    info['annos'] = annotations
+    return info
+
+
+def save_dataset_pkl(pcd_list, save_path):
+    print("processing data total:", len(pcd_list))
+    infos = []
+    for pcd in tqdm(pcd_list):
+        sample_idx = pcd.split(".pcd")[0]
+        info = get_infos(sample_idx)
+        if info:
+            infos.append(info)
+    with open(save_path, 'wb') as f:
+        pickle.dump(infos, f)
+    print(save_path, "is saved")
+    return infos
+
+def main():
+    args = parse_config()
+
+    ##############################################参数设置###########################################
+    args.cfg_file = "/userdata/16940/multi_task_opdt/tools/cfgs/leap_models/baseline_polyloss_fx_multi_task.yaml"
+    # args.ckpt = "/userdata/31289/multi_task_opdt/output/leap_models/baseline_polyloss_fx_multi_task/multi_task_vamodel_seg_v31_roty/ckpt/checkpoint_epoch_80.pth"
+    # args.ckpt = "/userdata/31289/multi_task_opdt/output/leap_models/baseline_polyloss_fx_multi_task/multi_task_vamodel_seg_v3/ckpt/checkpoint_epoch_28.pth"
+    experiment = "multi_task_vamodel_seg_v4_fine2nd_xzt_onlylaneaug_qat"#multi_task_vamodel_seg_v31_fine2nd_v5  multi_task_vamodel_seg_v31_roty_v4
+    epoch = "checkpoint_epoch_30.pth"
+
+    test_pcds = "2023_C11_car03-2023-09-02-14-47-52"
+    #2023_hesai_car05-20230731181702
+    #jianghong-2023-07-06-14-56-47_1
+    #haiwei-2023-07-06-15-34-52_0
+    #2023_C11_car03-2023-09-02-15-00-16
+    #2023_C11_car03-2023-09-02-14-08-59
+    #2023_C11_car03-2023-09-02-15-07-20
+
+    args.ckpt = "/userdata/16940/multi_task_opdt/output/leap_models/baseline_polyloss_fx_multi_task/multi_task_vamodel_seg_v4_fine2nd_xzt_laneaug/ckpt/checkpoint_epoch_40.pth" 
+    args.pcds = '/groupdata/share/semantic_leap/Hesai/sequences/lanes_wrong_pcd/pcd'
+    args.images = '/groupdata/share/semantic_leap/Hesai/sequences/lanes_wrong_pcd/image'
+    leap_path = "/groupdata/share/openset/leap_data/"
+    score_fiter = {'Car': 0.4, 'Pedestrian': 0.32, 'non-motor': 0.34, 'Bus': 0.46, 'Truck': 0.38, 'barrier': 0.3}
+    color_dict = {'Car': [1,0,0], 'Pedestrian': [1,1,0], 'non-motor': [0,0,1], 'Bus': [255,255,255], 'Truck': [0,1,1], 'barrier': [1,0,1]}
+    gt_color_dict = {'Car': [0,1,0], 'Pedestrian': [0,1,0], 'non-motor': [0,1,0], 'Bus': [0,1,0], 'Truck': [0,1,0], 'barrier': [0,1,0]}
+    learning_map_inv = {0:0, 1:1, 2:3, 3:4, 4:5, 5:6, 6:7, 7:8, 8:9, 9:10, 10:11, 11:13, 12:15, 13:16, 14:17, 15:18, 16:19, 17:17, 18:18, 19:19, 20:20, 21:21}
+    color_map = {
+        0: [255, 192, 203],
+        1: [255, 0, 255],
+        2: [175, 0, 75],
+        3: [255, 215, 0],
+        4: [150, 255, 170],
+        5: [255, 255, 255],
+        6: [255, 120, 50],
+        7: [100, 150, 245],
+        8: [80, 30, 180],
+        9: [100, 80, 250],
+        10: [255, 30, 30],
+        11: [255, 160, 122],
+        12: [0, 0, 230],
+        13: [100, 230, 245],
+        14: [255, 165, 0],
+        15: [102, 102, 156],
+        16: [255, 240, 150],
+        17: [255, 255, 0],
+        18: [107, 142, 35],
+        19: [0, 175, 0],
+        20: [135, 60, 0],
+        21: [135, 60, 0]
+    }
+    #################################################################################################
+    pkl_path = ''
+    cfg_from_yaml_file(args.cfg_file, cfg)
+    cfg.TAG = Path(args.cfg_file).stem
+    cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])
+    if args.images != None and os.path.exists(args.images):
+        image_list = [i.name for i in Path(args.images).rglob("*.jpg")]
+        image_list_num = np.array([int(image.split(".jpg")[0].replace(".", "")) for image in image_list])
+    if os.path.exists(args.pcds):
+        print("using pcd's tmp pkl")
+        tmp_pkl_path = args.pcds+"_tmp.pkl"
+        pcd_list = os.listdir(args.pcds)
+        save_dataset_pkl(pcd_list,tmp_pkl_path)
+        cfg.DATA_CONFIG["INFO_PATH"]["test"]=[tmp_pkl_path]
+        cfg.DATA_CONFIG["PCD_EXIST_PATHS"].append(args.pcds)
+    else:
+        print("using yaml's test pkl")
+        pkl_path = leap_path + cfg.DATA_CONFIG["INFO_PATH"]["test"][0]
+
+    
+    dist_test = False
+    total_gpus = 1
+    ckpt_dir = args.ckpt
+    log_file = './ros_log_tmp.txt'
+    logger = common_utils.create_logger(log_file, rank=cfg.LOCAL_RANK)
+
+    test_set, test_loader, sampler = build_dataloader(
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        batch_size=args.batch_size,
+        dist=dist_test, 
+        workers=args.workers, 
+        logger=logger, 
+        training=False,
+        pcd2json_path=args.pcd2json_path,
+        only_infer=True
+    )
+
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+    rospy.init_node('pillar_node', anonymous=True)
+    pcl_pub = rospy.Publisher('multi_task_seg', PointCloud2, queue_size=10)
+    # 使用实心框
+    # rviz_box_publisher = rospy.Publisher("pillar_detect", MarkerArray, queue_size=1)
+    if os.path.exists(pkl_path):
+        with open(pkl_path, 'rb') as g:
+            pkl_infos = pickle.load(g)
+        gt_annos = {}
+        for i in range(len(pkl_infos)):
+            gt_annos[pkl_infos[i]['point_cloud_info']['lidar_idx']] = pkl_infos[i]['annos']
+    with torch.no_grad():
+        model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test)
+        model.cuda()
+        dataset = test_loader.dataset
+        class_names =dataset.class_names
+        model.eval()
+        detector = Detector()
+        ground_trues = Ground_trues()
+        for i, batch_dict in enumerate(test_loader):
+            # if i < 600:
+            #     continue
+            if rospy.is_shutdown():
+                break
+            # if i < 800: continue
+            if args.images != None and len(image_list_num) != 0:
+                image_path = os.path.join(args.images,str(batch_dict["frame_id"][0])+".jpg")
+                if not os.path.exists(image_path):
+                    image_list_num_abs = np.abs(image_list_num - int(str(batch_dict["frame_id"][0]).replace(".", "")))
+                    near_image_name = image_list[np.argmin(image_list_num_abs)]
+                    image_path = os.path.join(args.images,near_image_name)
+                image_publish=rospy.Publisher("image",Image,queue_size=1)
+                try:
+                    img_data = cv2.imread(image_path)[:, :, ::-1]
+                    # import pdb; pdb.set_trace()
+                    image_tmp = Image()
+                    header=Header(stamp=rospy.Time.now())
+                    header.frame_id='map'
+                    image_tmp.height=img_data.shape[0]
+                    image_tmp.width=img_data.shape[1]
+                    image_tmp.encoding='rgb8'
+                    image_tmp.data=np.array(img_data).tostring()
+                    image_tmp.header=header
+                    image_tmp.step=img_data.shape[1]*3
+                    image_publish.publish(image_tmp)
+                except Exception as e:
+                    print(str(e))
+                    print("some thing wrong in ",image_path)
+
+            xyz = batch_dict['points_ori'][0,:,:3]
+            load_data_to_gpu(batch_dict)
+            t1 = time.time()
+            pred_dicts, ret_dict, hist_list_batch, lane_result_batch, all_result_dict = model(batch_dict)
+            seg_preds = all_result_dict["pred_seg"]
+            # lane_preds = all_result_dict["pred_lane"]
+            predict_labels = torch.argmax(seg_preds, dim=1)
+            predict_labels = predict_labels.cpu().detach().numpy()
+            grid_ind = all_result_dict["grid_ind"][0]
+            points_label = predict_labels[0, grid_ind[:, 1], grid_ind[:, 0], grid_ind[:, 2]]
+            colors = [color_map[learning_map_inv[label]] for label in points_label]
+            colors = np.array(colors, dtype=np.uint8)
+            colors = (colors / 255.0).astype(np.float32)
+            t2 = time.time()
+            print("\n########################### PCD INFO #############################")
+            print('model inference = ', t2 - t1)
+            print('pcd name:',str(batch_dict["frame_id"][0])+".pcd")
+            # 增加gt label
+            if os.path.exists(pkl_path):
+                gt_labels = gt_infos_to_label_objects(gt_annos, batch_dict["frame_id"][0])
+                if len(gt_labels) != 0:
+                    boxs=[]
+                    labels=[]
+                    for gt_label in gt_labels:
+                        boxs.append([gt_label.bbox_3d.x,gt_label.bbox_3d.y,gt_label.bbox_3d.z,
+                        gt_label.bbox_3d.height,gt_label.bbox_3d.width,gt_label.bbox_3d.length,
+                        gt_label.bbox_3d.rotation
+                        ])
+                        labels.append(gt_label.label)
+                    boxs=torch.tensor(boxs)
+                    corners3ds = ground_trues.boxes_to_corners_3d(boxs)
+                    lines = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
+                    [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]]
+                    ground_trues.display(corners3ds, lines, labels, gt_color_dict)
+            predictions = pointpillars_output_to_label_objects(pred_dicts,score_fiter)
+            if len(predictions) != 0:
+                boxs=[]
+                labels=[]
+                for prediction in predictions:
+                    boxs.append([prediction.bbox_3d.x,prediction.bbox_3d.y,prediction.bbox_3d.z,
+                    prediction.bbox_3d.height,prediction.bbox_3d.width,prediction.bbox_3d.length,
+                    prediction.bbox_3d.rotation
+                    ])
+                    labels.append(prediction.label)
+                boxs=torch.tensor(boxs)
+                corners3ds = detector.boxes_to_corners_3d(boxs)
+                lines = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
+                [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]]
+                detector.display(corners3ds, lines, labels, color_dict)
+            else:
+                boxs=[[-40,0,0,0.01,0.01,0.01,0]]
+                labels=["Car"]
+                boxs=torch.tensor(boxs)
+                corners3ds = detector.boxes_to_corners_3d(boxs)
+                lines = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6],
+                [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]]
+                detector.display(corners3ds, lines, labels, color_dict)
+
+            # 定义点云
+            msg = PointCloud2()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = 'multi_task'
+            msg.height = 1
+            msg.width = len(xyz)
+            msg.fields = [
+                PointField('x', 0, PointField.FLOAT32, 1),
+                PointField('y', 4, PointField.FLOAT32, 1),
+                PointField('z', 8, PointField.FLOAT32, 1),
+                PointField('r', 12, PointField.FLOAT32, 1),
+                PointField('g', 16, PointField.FLOAT32, 1),
+                PointField('b', 20, PointField.FLOAT32, 1),
+            ]
+            msg.is_bigendian = False
+            msg.point_step = 24
+            msg.row_step = msg.point_step * len(xyz)
+            msg.is_dense = np.isfinite(xyz).all()
+            data = np.hstack((xyz,colors))
+            msg.data = data.tobytes()
+            
+            # 使用实心框
+            # rviz_boxes = MarkerArray()
+            # rviz_box = Marker()
+            # rviz_box.action = Marker.DELETEALL
+            # rviz_boxes.markers.append(rviz_box)
+
+            print("boxes num:", len(predictions))
+            for id, pred in enumerate(predictions):
+                print(pred.label,
+                round(pred.bbox_3d.x.cpu().item(),2),
+                round(pred.bbox_3d.y.cpu().item(),2),
+                round(pred.bbox_3d.z.cpu().item(),2),
+                round(pred.bbox_3d.height.cpu().item(),2),
+                round(pred.bbox_3d.width.cpu().item(),2),
+                round(pred.bbox_3d.length.cpu().item(),2),
+                round(pred.bbox_3d.rotation.cpu().item(),2),
+                round(pred.score.cpu().item(),2)
+                )
+                # 使用实心框
+                # rviz_box = convert_prediction_to_rviz_box(pred)
+                # rviz_box.id = id
+                # rviz_box.ns = 'pointpllars_namespace'
+                # rviz_boxes.markers.append(rviz_box)
+            # 使用实心框
+            # rviz_box_publisher.publish(rviz_boxes)
+            pcl_pub.publish(msg)
+            # time.sleep(0.5)
+            print("##################################################################")
+            # if batch_dict["frame_id"][0] == 'car01_09230801_060520_1676441120.002087':
+            # import pdb; pdb.set_trace()
+    if os.path.exists(args.pcds):
+        os.remove(tmp_pkl_path)
+        print("tmp pkl is removed")
+    os.remove(log_file)
+    print("tmp log file is removed")
+
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        exit()

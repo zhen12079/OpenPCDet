@@ -1,0 +1,55 @@
+import torch
+import copy
+def export_onnx(model,save_path):
+    # model=copy.deepcopy(model_src)
+    # dataloader_iter = iter(data_loader)
+    # try:
+    #     batch = next(dataloader_iter)
+    # except StopIteration:
+    #     dataloader_iter = iter(data_loader)
+    #     batch = next(dataloader_iter)
+    #     print('new iters')
+    model.eval()
+    with torch.no_grad():
+        MAX_VOXELS = 20000
+
+        dummy_voxels = torch.zeros(
+            (MAX_VOXELS, 48, 4),
+            dtype=torch.float32,
+            device='cuda:0')
+
+        dummy_voxel_idxs = torch.zeros(
+            (MAX_VOXELS, 4),
+            dtype=torch.int32,
+            device='cuda:0')
+        # dim11
+        dummy_voxel_num = torch.zeros(
+            (MAX_VOXELS),
+            dtype=torch.int32,
+            device='cuda:0')
+        dummy_input = dict()
+        dummy_input['voxels'] = dummy_voxels
+        dummy_input['voxel_num_points'] = dummy_voxel_num
+        dummy_input['voxel_coords'] = dummy_voxel_idxs
+        dummy_input['batch_size'] = 1
+        # # print(batch)
+        # dummy_input = dict()
+        # dummy_input['voxels'] = torch.from_numpy(batch["voxels"])[:MAX_VOXELS,-1].cuda()
+        # dummy_input['voxel_num_points'] = torch.from_numpy(batch["voxel_num_points"])[:MAX_VOXELS].cuda()
+        # dummy_input['voxel_coords'] = torch.from_numpy(batch["voxel_coords"])[:MAX_VOXELS,-1].cuda()
+        # dummy_input['batch_size'] = 1
+        # print(dummy_input['voxels'].shape,dummy_input['voxel_num_points'].shape,dummy_input['voxel_coords'].shape)
+        # # save_name = Path(args.ckpt).name
+        torch.onnx.export(model,  # model being run
+                          dummy_input,  # model input (or a tuple for multiple inputs)
+                          save_path,  # where to save the model (can be a file or file-like object)
+                          export_params=True,  # store the trained parameter weights inside the model file
+                          opset_version=13,  # the ONNX version to export the model to
+                          do_constant_folding=True,  # whether to execute constant folding for optimization
+                          keep_initializers_as_inputs=True,
+                          input_names=['voxels', 'voxel_num', 'voxel_idxs'],  # the model's input names
+                          output_names=['cls_preds', 'box_preds', 'dir_cls_preds'],  # the model's output names
+                          )
+    print(save_path)
+    print("onnx export done")
+    # model.train()

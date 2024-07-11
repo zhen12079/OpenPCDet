@@ -1,0 +1,149 @@
+# ! when using this yaml, set `ignore_label=255` in dataset
+name: "leap"
+labels:
+  0: "Void"
+  1: "Drivable"
+  2: "Other-ground"
+  3: "Sidewalk"
+  4: "Lane"
+  5: "Road-edge"
+  6: "Fence"
+  7: "Car"
+  8: "Truck"
+  9: "Bus"
+  10: "Pedestrian"
+  11: "Rider"
+  12: "Other-people"
+  13: "Non-motor"
+  14: "Building"
+  15: "Traffic light"
+  16: "Pole"
+  17: "Traffic sign"
+  18: "Barrier"
+  19: "Vegetation"
+  20: "Tree trunk"
+  21: "Tree trunk"
+color_map: # rgb
+ # 0: [207, 207, 207]
+  0: [255, 255, 255]
+  1: [255, 0, 255]
+  2: [175, 0, 75]
+  3: [255, 215, 0]
+  4: [150, 255, 170]
+  5: [255, 255, 255]
+  6: [255, 120, 50]
+  7: [100, 150, 245]
+  8: [80, 30, 180]
+  9: [100, 80, 250]
+  10: [255, 30, 30]
+  11: [255, 160, 122]
+  12: [0, 0, 230]
+  13: [100, 230, 245]
+  14: [255, 165, 0]
+  15: [102, 102, 156]
+  16: [255, 240, 150]
+  17: [255, 255, 0]
+  18: [107, 142, 35]
+  19: [0, 175, 0]
+  20: [135, 60, 0]
+content: # as a ratio with the total number of points
+  0: 0.024893236823706942
+  1: 0.290431497120015
+  2: 0.007472111872068381
+  3: 0.009281666657655965
+  4: 0.014713947273726932
+  5: 0.006868852865702939
+  6: 0.31015177808183964
+  7: 0.08203220208366649
+  8: 0.0032178201602528103
+  9: 0.0030097103002468986
+  10: 0.0037409427090402594
+  11: 0.008410743939314184
+  12: 0.00021456408850449297
+  13: 0.003813300048137764
+  14: 0.03170017165117624
+  15: 0.002254680938202504
+  16: 0.009737738046995074
+  17: 0.006928072894573001
+  18: 0.002247088117599557
+  19: 0.04346992779140604
+  20: 0.13540994653616892
+# classes that are indistinguishable from single scan or inconsistent in
+# ground truth are mapped to their closest equivalent
+learning_map:
+  0: 0
+  1: 1 # freespace
+  2: 1 # undriveable -> freespace
+  3: 2
+  4: 3
+  5: 4
+  6: 5
+  7: 6
+  8: 7
+  9: 8
+  10: 9
+  11: 10
+  12: 10 # other-people -> people
+  13: 11
+  14: 0 # building -> voild
+  15: 12
+  16: 13
+  17: 14
+  18: 15
+  19: 16
+  20: 0 # vegetation -> voild
+  21: 0
+learning_map_inv: # inverse of previous map
+  0: 0
+  1: 1
+  2: 3
+  3: 4
+  4: 5
+  5: 6
+  6: 7
+  7: 8
+  8: 9
+  9: 10
+  10: 11
+  11: 13
+  12: 15
+  13: 16
+  14: 17
+  15: 18
+  16: 19
+  17: 17
+  18: 18
+  19: 19
+  20: 20 
+learning_ignore: # Ignore classes
+  0: False
+  1: False
+  2: False
+  3: False
+  4: False
+  5: False
+  6: False
+  7: False
+  8: False
+  9: False
+  10: False
+  11: False
+  12: False
+  13: False
+  14: False
+  15: False
+  16: False
+  17: False
+  18: False
+  19: False
+  20: False
+split: # sequence numbers
+  train:
+    - train_00
+    - train_01
+    - train_02
+    - train_03
+  valid:
+    - valid_00
+  test:
+    - pcd

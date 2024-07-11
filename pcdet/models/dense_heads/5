@@ -1,0 +1,94 @@
+import copy
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.nn.init import kaiming_normal_
+from ..model_utils import model_nms_utils
+from ..model_utils import centernet_utils
+from ...utils import loss_utils
+from ...ops.roiaware_pool3d import roiaware_pool3d_utils
+import copy
+from copy import deepcopy
+import cv2
+from .losses import lovasz_softmax
+
+class SegmentHead_multitask(nn.Module):
+    def __init__(self, model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range, voxel_size):
+        super().__init__()
+        self.model_cfg = model_cfg
+        self.shared_conv = nn.Sequential(
+            nn.Conv2d(
+                input_channels+64, self.model_cfg.SHARED_CONV_CHANNEL, 3, stride=1, padding=1,
+                bias=self.model_cfg.get('USE_BIAS_BEFORE_NORM', False)
+            ),
+            nn.BatchNorm2d(self.model_cfg.SHARED_CONV_CHANNEL, eps=1e-3, momentum=0.01),
+            nn.ReLU(),
+        )
+        self.deblocks = nn.Sequential(
+            nn.ConvTranspose2d(self.model_cfg.SHARED_CONV_CHANNEL, self.model_cfg.SHARED_CONV_CHANNEL, 2, stride=2,
+                               bias=False),
+            nn.BatchNorm2d(self.model_cfg.SHARED_CONV_CHANNEL, eps=1e-3, momentum=0.01),
+            nn.ReLU(),
+        )
+        self.normal_conv = nn.Sequential(
+            nn.Conv2d(
+                64, 64, 3, stride=1, padding=1,
+                bias=self.model_cfg.get('USE_BIAS_BEFORE_NORM', False)
+            ),
+            nn.BatchNorm2d(self.model_cfg.SHARED_CONV_CHANNEL, eps=1e-3, momentum=0.01),
+            nn.ReLU(),
+        )
+        self.seg_out_conv = nn.Conv2d(64, 32*17, 1)
+        self.forward_ret_dict = {}
+
+    def get_loss(self):
+        pred_dicts = self.forward_ret_dict['pred_dicts']
+        target_dicts = self.forward_ret_dict['target_dicts']
+        if pred_dicts.shape[0] != target_dicts.shape[0]:
+            print("pred_dicts.shape",pred_dicts.shape)
+            print("target_dicts.shape", target_dicts.shape)
+            if pred_dicts.shape[0] < target_dicts.shape[0]:
+                self.forward_ret_dict['target_dicts'] = self.forward_ret_dict['target_dicts'][:pred_dicts.shape[0],...]
+            else:
+                self.forward_ret_dict['target_dicts']  = torch.cat((self.forward_ret_dict['target_dicts'] , self.forward_ret_dict['target_dicts'][-(self.forward_ret_dict['pred_dicts'].shape[0] - self.forward_ret_dict['target_dicts'].shape[0]):,...]), 0)
+            print("after target_dicts.shape", self.forward_ret_dict['target_dicts'].shape)
+        target_dicts = self.forward_ret_dict['target_dicts']
+        loss_fun = torch.nn.CrossEntropyLoss(ignore_index=255)
+        lovaszloss = lovasz_softmax(torch.nn.functional.softmax(pred_dicts, dim=1), target_dicts, ignore=255)
+        celoss = loss_fun(pred_dicts, target_dicts.long())  # torch.Size([4, 20, 512, 512, 32]) torch.Size([4, 512, 512, 32])
+        # print(outputs.shape,voxel_labels.shape)
+        loss = lovaszloss + celoss
+        batch_size = pred_dicts.shape[0]
+        loss /= batch_size
+        loss *= self.model_cfg.LOSS_WEIGHTS
+        tb_dict = {}
+        tb_dict['seg_loss'] = loss.item()
+        return loss, tb_dict
+
+
+    def forward(self, data_dict):
+        # spatial_features_2d = data_dict['spatial_features_2d']
+        spatial_features_2d = data_dict['seg_features_2d_up']
+        seg_features_2d = data_dict['seg_features_2d']
+        x = torch.cat([spatial_features_2d, seg_features_2d], dim=1)
+        # print("x.shape",x.shape)
+        x = self.shared_conv(x)
+        x = self.deblocks(x)
+        x = self.normal_conv(x)
+        x = self.seg_out_conv(x)
+        x = x.permute(0, 2, 3, 1)
+        new_shape = list(x.size())[:3] + [32, 17]
+        x = x.view(new_shape)
+        x = x.permute(0, 4, 1, 2, 3)
+
+        # pred_dicts = []
+        # 496*432*32*20
+        # 496*432*32*1
+        if self.training:
+            self.forward_ret_dict['target_dicts'] = data_dict['gt_seg']
+            self.forward_ret_dict['pred_dicts'] = x
+        else:
+            data_dict['pred_seg'] = x
+
+
+        return data_dict

@@ -1,0 +1,98 @@
+import numpy as np
+import torch
+from pytorch_quantization import nn as quant_nn
+from pytorch_quantization import calib
+
+quant_nn.TensorQuantizer.use_fb_fake_quant=True
+
+# from pcdet.utils import common_utils, commu_utils
+
+def load_data_to_gpu(batch_dict):
+    for key, val in batch_dict.items():
+        # print(key,val.shape)
+        # if key in ["voxels"]:
+        #     val[val==0]=0.1
+        #     print(val.shape)
+        #     print(val)
+        #     print(np.isnan(np.min(val)))
+
+        if not isinstance(val, np.ndarray):
+            continue
+        elif key in ['frame_id', 'metadata', 'calib']:
+            continue
+        elif key in ['images']:
+            batch_dict[key] = kornia.image_to_tensor(val).float().cuda().contiguous()
+        elif key in ['image_shape']:
+            batch_dict[key] = torch.from_numpy(val).int().cuda()
+        else:
+            batch_dict[key] = torch.from_numpy(val).float().cuda()
+
+def collect_stats(model, data_loader, model_func, num_batches=2):
+    " Feed data to the network and collect statistic "
+
+    # Enable calibrators
+    for name, module in model.named_modules():
+        if isinstance(module, quant_nn.TensorQuantizer):
+            if module._calibrator is not None:
+                module.disable_quant()
+                module.enable_calib()
+            else:
+                module.disable()
+    
+    # load image
+    accumulated_iter = 0
+    # if rank == 0:
+    #     pbar = tqdm.tqdm(total=total_it_each_epoch, leave=leave_pbar, desc='train', dynamic_ncols=True)       
+        
+    total_it_each_epoch = len(data_loader)
+    total_batch = min(total_it_each_epoch, num_batches)
+    dataloader_iter = iter(data_loader)
+    for cur_it in range(total_batch):        
+        # get data
+        try:
+            batch = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(data_loader)
+            batch = next(dataloader_iter)
+            print('new iters')
+    
+        # forward
+        # model_func(model, batch)  
+        load_data_to_gpu(batch)
+        model(batch)
+        
+        # # pbar
+        accumulated_iter += 1
+        # pbar.update()
+        # pbar.set_postfix(dict(total_it=accumulated_iter))    
+        print(' iter: ', accumulated_iter)
+
+
+    # Disable calibrators
+    for name, module in model.named_modules():
+        if isinstance(module, quant_nn.TensorQuantizer):
+            if module._calibrator is not None:
+                module.enable_quant()
+                module.disable_calib()
+            else:
+                module.enable()
+
+def compute_amax(model, **kwargs):
+    # local calib result
+    for name, module in model.named_modules():
+        if isinstance(module, quant_nn.TensorQuantizer):
+            if module._calibrator is not None:
+                # print(name)
+                if isinstance(module._calibrator, calib.MaxCalibrator):
+                    module.load_calib_amax(strict=True)
+                else:
+                    module.load_calib_amax(**kwargs)
+            print(F"{name:40}:{module}")
+    model.cuda()
+
+def calibrate(model, data_loader, model_func, num_batches=2, **kwargs):
+    model.eval()
+    with torch.no_grad():
+        collect_stats(model, data_loader, model_func, num_batches)
+        compute_amax(model, **kwargs)
+    model.train()

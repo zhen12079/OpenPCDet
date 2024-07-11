@@ -1,4 +1,4 @@
-d_init.pyfrom .base_bev_backbone import BaseBEVBackbone
+from .base_bev_backbone import BaseBEVBackbone
 from .base_bev_backbone_cspbased import BaseBEVBackbone_cspbased
 from .backbone_cspdarknet53 import CSPDarknet53
 from .backbone_cspdarknet53_fpn import CSPDarknet53_fpn
